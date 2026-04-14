@@ -6,6 +6,7 @@ import Legend from '@/components/Legend';
 import Toolbar from '@/components/Toolbar';
 import StatsPanel from '@/components/StatsPanel';
 import TitleCard from '@/components/TitleCard';
+import SpotPopup from '@/components/SpotPopup';
 
 export type NutritionCategory = 'normal' | 'underweight' | 'severe' | 'overweight';
 
@@ -14,6 +15,9 @@ export interface Spot {
   lng: number;
   lat: number;
   category: NutritionCategory;
+  name?: string;
+  age?: string;
+  notes?: string;
 }
 
 export const CATEGORY_COLORS: Record<NutritionCategory, string> = {
@@ -96,9 +100,38 @@ export default function SpotMap() {
   const [spots, setSpots] = useState<Spot[]>([]);
   const [mapStyle, setMapStyle] = useState<MapStyle>('osm');
   const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
+  const [selectedSpot, setSelectedSpot] = useState<Spot | null>(null);
+  const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
 
-  const handleToolbarCollapse = () => {
-    setToolbarCollapsed((v) => !v);
+  const handleSaveSpot = (updated: Spot) => {
+    const next = spotsRef.current.map((s) => s.id === updated.id ? updated : s);
+    spotsRef.current = next;
+    setSpots(next);
+    saveSpots(next);
+    // Update marker color if category changed
+    const marker = markersRef.current.get(updated.id);
+    if (marker) {
+      const el = marker.getElement();
+      const svg = el.querySelector('svg');
+      if (svg) svg.setAttribute('fill', CATEGORY_COLORS[updated.category]);
+      el.title = updated.name ? `${updated.name} (${updated.category})` : updated.category;
+    }
+    setSelectedSpot(null);
+    setPopupPos(null);
+  };
+
+  const handleDeleteSpot = (id: string) => {
+    const marker = markersRef.current.get(id);
+    if (marker) { marker.remove(); markersRef.current.delete(id); }
+    const next = spotsRef.current.filter((s) => s.id !== id);
+    spotsRef.current = next;
+    setSpots(next);
+    saveSpots(next);
+    setSelectedSpot(null);
+    setPopupPos(null);
+  };
+
+  const handleToolbarCollapse = () => {    setToolbarCollapsed((v) => !v);
     // Let the DOM update then resize the map to fill new space
     setTimeout(() => mapInstanceRef.current?.resize(), 50);
   };
@@ -140,23 +173,14 @@ export default function SpotMap() {
       saveSpots(next);
     });
 
-    // Left-click → cycle category
+    // Left-click → open detail popup
     el.addEventListener('click', (e) => {
       e.stopPropagation();
-      const order: NutritionCategory[] = ['normal', 'underweight', 'severe', 'overweight'];
       const current = spotsRef.current.find((s) => s.id === spot.id);
       if (!current) return;
-      const nextCat = order[(order.indexOf(current.category) + 1) % order.length];
-      const svgEl = el.querySelector('svg');
-      if (svgEl) svgEl.setAttribute('fill', CATEGORY_COLORS[nextCat]);
-      el.title = nextCat;
-      spot.category = nextCat;
-      const next = spotsRef.current.map((s) =>
-        s.id === spot.id ? { ...s, category: nextCat } : s
-      );
-      spotsRef.current = next;
-      setSpots(next);
-      saveSpots(next);
+      const rect = el.getBoundingClientRect();
+      setPopupPos({ x: rect.left + rect.width / 2, y: rect.top });
+      setSelectedSpot({ ...current });
     });
 
     // Right-click → remove
@@ -389,11 +413,59 @@ export default function SpotMap() {
 
       const mapDataUrl = map.getCanvas().toDataURL('image/jpeg', 0.95);
 
+      // --- Draw markers onto PDF using projected coordinates ---
+      // After resize, map.project() gives us the correct pixel position for each spot
+      const spotsSnapshot = spotsRef.current;
+
       // --- Compose PDF ---
       const pdf = new jsPDF({ orientation: 'landscape', unit: 'px', format: [PAGE_W, PAGE_H], putOnlyUsedFonts: true });
 
       // Map fills the entire page
       pdf.addImage(mapDataUrl, 'JPEG', 0, 0, PAGE_W, PAGE_H);
+
+      // Draw each house marker at its projected position
+      const MARKER_SIZE = 22;
+      for (const spot of spotsSnapshot) {
+        const px = map.project([spot.lng, spot.lat]);
+        const x = px.x - MARKER_SIZE / 2;
+        const y = px.y - MARKER_SIZE; // anchor at bottom-center like the DOM marker
+
+        const color = CATEGORY_COLORS[spot.category];
+        // Parse hex color to RGB
+        const r = parseInt(color.slice(1, 3), 16);
+        const g = parseInt(color.slice(3, 5), 16);
+        const b = parseInt(color.slice(5, 7), 16);
+
+        // House body (filled rectangle)
+        pdf.setFillColor(r, g, b);
+        pdf.setDrawColor(255, 255, 255);
+        pdf.setLineWidth(1);
+
+        // Roof triangle
+        pdf.triangle(
+          x, y + MARKER_SIZE * 0.45,
+          x + MARKER_SIZE / 2, y,
+          x + MARKER_SIZE, y + MARKER_SIZE * 0.45,
+          'FD'
+        );
+        // House body
+        pdf.rect(x + MARKER_SIZE * 0.1, y + MARKER_SIZE * 0.42, MARKER_SIZE * 0.8, MARKER_SIZE * 0.58, 'FD');
+        // Door (white)
+        pdf.setFillColor(255, 255, 255);
+        pdf.rect(
+          x + MARKER_SIZE * 0.35, y + MARKER_SIZE * 0.65,
+          MARKER_SIZE * 0.3, MARKER_SIZE * 0.35,
+          'F'
+        );
+
+        // Label with child name if available
+        if (spot.name) {
+          pdf.setFontSize(6.5);
+          pdf.setTextColor(30, 41, 59);
+          pdf.setFont('helvetica', 'bold');
+          pdf.text(spot.name, x + MARKER_SIZE / 2, y - 3, { align: 'center' });
+        }
+      }
 
       // Place each panel at its normalized screen position, scaled to PDF dimensions
       const placePanel = (cap: PanelCapture) => {
@@ -449,6 +521,16 @@ export default function SpotMap() {
 
       <StatsPanel spots={spots} />
 
+      {selectedSpot && popupPos && (
+        <SpotPopup
+          spot={selectedSpot}
+          pos={popupPos}
+          onSave={handleSaveSpot}
+          onDelete={handleDeleteSpot}
+          onClose={() => { setSelectedSpot(null); setPopupPos(null); }}
+        />
+      )}
+
       <Toolbar
         pitch={pitch}
         bearing={bearing}
@@ -463,7 +545,6 @@ export default function SpotMap() {
         mapStyle={mapStyle}
         onMapStyleChange={setMapStyle}
         onDownloadPdf={handleDownloadPdf}
-        onPrint={() => window.print()}
         pdfLoading={pdfLoading}
         collapsed={toolbarCollapsed}
         onToggleCollapse={handleToolbarCollapse}
